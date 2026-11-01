@@ -36,6 +36,7 @@ from switch_core.room_wide_mention import is_reserved_mention_name
 from switch_core.transport import InboundMessage, RoomRef
 
 if TYPE_CHECKING:
+    from switch_core.bridges.resource.service import ResourceService
     from switch_core.room_service import RoomService
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class CommandConsumer(Consumer[SystemActor]):
         document_store: DocumentStore,
         reference_store: ReferenceStore,
         package_store: PackageStore,
+        resource_service: ResourceService,
         agent_session_store: AgentSessionStore,
         room_service: RoomService,
         user_store: UserStore,
@@ -87,6 +89,7 @@ class CommandConsumer(Consumer[SystemActor]):
         self._document_store = document_store
         self._reference_store = reference_store
         self._package_store = package_store
+        self._resource_service = resource_service
         self._agent_session_store = agent_session_store
         self._room_service = room_service
         self._user_store = user_store

@@ -48,6 +48,7 @@ def _consumer() -> CommandConsumer:
             list_document_ids_for_package=AsyncMock(return_value=["doc-1"]),
             list_reference_ids_for_package=AsyncMock(return_value=["ref-1"]),
         ),
+        resource_service=MagicMock(),
         agent_session_store=MagicMock(),
         room_service=MagicMock(),
         user_store=MagicMock(),

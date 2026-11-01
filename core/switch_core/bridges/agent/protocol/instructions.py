@@ -38,9 +38,16 @@ def build_room_instructions(
                 _room_setup(room, bridge),
             ]
         )
-    if room.instructions:
-        sections.append("## Room-specific instructions\n\n" + room.instructions.strip())
+    room_specific = room_specific_instructions(room)
+    if room_specific:
+        sections.append("## Room-specific instructions\n\n" + room_specific)
     return "\n\n".join(sections)
+
+
+def room_specific_instructions(room: Room) -> str:
+    """The instructions this room was given, as a joining agent receives them;
+    empty when it has none."""
+    return (room.instructions or "").strip()
 
 
 def _overview(agent: Agent, room: Room) -> str:

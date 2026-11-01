@@ -131,6 +131,7 @@ async def _process(
         document_store=DocumentStore(),
         reference_store=ReferenceStore(),
         package_store=PackageStore(),
+        resource_service=MagicMock(),
         agent_session_store=AgentSessionStore(),
         room_service=MagicMock(),
         user_store=UserStore(),

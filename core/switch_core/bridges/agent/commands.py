@@ -5,7 +5,7 @@ import random
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import select
 
@@ -23,6 +23,7 @@ from switch_core.bridges.agent.protocol.agent_core import (
     AgentExistsError,
     AgentRenameRefused,
 )
+from switch_core.bridges.agent.protocol.instructions import room_specific_instructions
 from switch_core.bridges.agent.protocol.statuses import compute_agent_statuses
 from switch_core.bridges.agent.protocol.types import (
     AgentEvent,
@@ -53,7 +54,7 @@ from switch_core.platform_access import administers_on_record
 from switch_core.transport import RoomRef
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from switch_core.clients.command_consumer import CommandConsumer
     from switch_core.clients.room_meta import RoomMeta
@@ -489,7 +490,12 @@ async def _retry_refusal(
         if message is None:
             return "Could not retry: that message is not in this room."
         if message.sender_id != event.user_id and not await _manages_room(
-            client, session, room_id, event.user_id
+            client._addressing,
+            client.session_factory,
+            session,
+            room_id,
+            event.user_id,
+            command="retry",
         ):
             return (
                 "Could not retry: only whoever sent that message, or someone who "
@@ -507,11 +513,17 @@ async def _retry_refusal(
 
 
 async def _manages_room(
-    client: AgentRecipient, session: AsyncSession, room_id: str, sender: str
+    resolver: AddressingResolver,
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    room_id: str,
+    sender: str,
+    *,
+    command: str,
 ) -> bool:
     """Whether the Switch user behind `sender` owns the room or administers
-    the tenant."""
-    principal = await client._addressing.resolve_sender(session, sender)
+    the tenant. `command` is what an admin's override is recorded under."""
+    principal = await resolver.resolve_sender(session, sender)
     if principal is None or principal.kind != "user":
         return False
     room = await session.get(Room, room_id)
@@ -522,12 +534,12 @@ async def _manages_room(
         user = await session.get(User, user_id)
         if user is not None and await administers_on_record(
             session,
-            client.session_factory,
+            session_factory,
             users,
             user,
             target_type="room",
             target_id=room_id,
-            details={"event": "chat_command", "command": "retry"},
+            details={"event": "chat_command", "command": command},
         ):
             return True
     return False
@@ -1301,6 +1313,18 @@ async def _cmd_remove_agent(
     await _reply(client, room, event, f"Removed **{_label(target)}** from this room.")
 
 
+def _admin_resolver(host: CommandConsumer) -> AddressingResolver:
+    """Who a command's sender is, as the admin client resolves them."""
+    return AddressingResolver(
+        room_store=host._room_store,
+        room_role_store=host._room_role_store,
+        client_store=host.client_store,
+        agent_store=host._agent_store,
+        external_user_store=host._external_user_store,
+        live_connection_ids=host._connections.live_connection_ids,
+    )
+
+
 async def _may_remove_agent(
     host: CommandConsumer,
     session: AsyncSession,
@@ -1313,14 +1337,7 @@ async def _may_remove_agent(
     Anyone the agent would take instructions from may; so may a workspace
     admin, and an agent that manages agents for the target's owner.
     """
-    resolver = AddressingResolver(
-        room_store=host._room_store,
-        room_role_store=host._room_role_store,
-        client_store=host.client_store,
-        agent_store=host._agent_store,
-        external_user_store=host._external_user_store,
-        live_connection_ids=host._connections.live_connection_ids,
-    )
+    resolver = _admin_resolver(host)
     decision = await resolver.permitted(
         session, agent=target, room_id=room_id, sender=event.user_id
     )
@@ -1881,6 +1898,144 @@ async def _cmd_list_references(
     await _reply(client, room, event, "\n".join(lines))
 
 
+async def _cmd_briefing(
+    client: AgentRecipient,
+    room: RoomRef,
+    event: CommandEvent,
+    _is_direct: bool,
+) -> None:
+    """What an agent is handed about this room when it joins, read from what
+    `connect_to_room` returns, so the room's briefing can be checked without
+    spending an agent on it.
+
+    What a reference points at is shown only to whoever manages the room: a
+    repository or a board id is for the agents and the operator, and the
+    channel may hold people who are neither.
+    """
+    meta = await client._resolve_room_meta(room.room_id)
+    if meta is None:
+        await _reply(client, room, event, "Room not found.")
+        return
+
+    # Admin-owned, so the admin client runs it.
+    host = cast("CommandConsumer", client)
+    async with host.session_factory() as session:
+        stored = await host._room_store.get(session, meta.room_id)
+        if stored is None:
+            await _reply(client, room, event, "Room not found.")
+            return
+        instructions = room_specific_instructions(stored)
+        resources = await host._resource_service.list_room_resources(
+            session, meta.room_id
+        )
+        show_targets = await _manages_room(
+            _admin_resolver(host),
+            host.session_factory,
+            session,
+            meta.room_id,
+            event.user_id,
+            command="briefing",
+        )
+
+    lines = [
+        f"**What an agent joining {stored.name} is handed**",
+        "_Besides Switch's general guidance, which is the same in every room._",
+        "",
+        "**Room instructions**",
+        instructions
+        if instructions
+        else "_None. An agent joining this room gets only Switch's general guidance._",
+        "",
+        "**Documents**",
+        *(_briefing_documents(resources["documents"]) or ["_None._"]),
+        "",
+        "**References**",
+        *(
+            _briefing_references(resources["references"], show_targets=show_targets)
+            or ["_None._"]
+        ),
+        "",
+        "**Packages**",
+        *(
+            _briefing_packages(resources["packages"], show_targets=show_targets)
+            or ["_None._"]
+        ),
+        "",
+        "**Linked rooms**",
+        *(
+            [
+                f"- **{link['target_room_name']}**"
+                + (f" — {link['label']}" if link["label"] else "")
+                for link in resources["linked_rooms"]
+            ]
+            or ["_None._"]
+        ),
+    ]
+    if not show_targets and _any_reference(resources):
+        lines += [
+            "",
+            "_What each reference points at is shown to whoever manages the room._",
+        ]
+    await _reply(client, room, event, "\n".join(lines))
+
+
+def _briefing_documents(documents: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for doc in documents:
+        desc = f" — {doc['description']}" if doc["description"] else ""
+        lines.append(f"- **{doc['name']}**{desc}")
+        lines += _briefing_instructions(doc["instructions"])
+    return lines
+
+
+def _briefing_references(
+    references: list[dict[str, Any]], *, show_targets: bool
+) -> list[str]:
+    lines: list[str] = []
+    for ref in references:
+        desc = f" — {ref['description']}" if ref["description"] else ""
+        lines.append(f"- **{ref['name']}** _({ref['type']})_{desc}")
+        lines += _briefing_instructions(ref["instructions"])
+        if show_targets and ref["value"]:
+            target = ", ".join(
+                f"{key}: `{value}`" for key, value in ref["value"].items()
+            )
+            lines.append(f"  Points at: {target}")
+    return lines
+
+
+def _briefing_packages(
+    packages: list[dict[str, Any]], *, show_targets: bool
+) -> list[str]:
+    lines: list[str] = []
+    for pkg in packages:
+        desc = f" — {pkg['description']}" if pkg["description"] else ""
+        lines.append(f"- **{pkg['name']}**{desc}")
+        lines += _briefing_instructions(pkg["instructions"])
+        for doc_line in _briefing_documents(pkg["documents"]):
+            lines.append(f"  {doc_line}")
+        for ref_line in _briefing_references(
+            pkg["references"], show_targets=show_targets
+        ):
+            lines.append(f"  {ref_line}")
+    return lines
+
+
+def _briefing_instructions(text: str | None) -> list[str]:
+    """An item's own instructions, indented under it line by line so a
+    multi-line one stays part of its item."""
+    if not text or not text.strip():
+        return ["  _No instructions._"]
+    first, *rest = text.strip().splitlines()
+    return [f"  Instructions: {first}", *(f"  {line}" for line in rest)]
+
+
+def _any_reference(resources: dict[str, Any]) -> bool:
+    return bool(resources["references"]) or any(
+        pkg["references"] for pkg in resources["packages"]
+    )
+
+
 async def _cmd_room_url(
     client: AgentRecipient,
     room: RoomRef,
@@ -2073,6 +2228,13 @@ COMMANDS: list[Command] = [
         "list-references",
         "List the room's references.",
         _cmd_list_references,
+        admin_owned=True,
+    ),
+    Command(
+        "briefing",
+        "Show what an agent joining this room is handed: its instructions, "
+        "documents, references, packages and linked rooms.",
+        _cmd_briefing,
         admin_owned=True,
     ),
     Command(

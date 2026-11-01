@@ -85,6 +85,11 @@ version of their own to them without also giving them a release of their own.
   Now a room the runner cannot read reads as missing.
 
 #### Added
+- **`!briefing` shows what an agent joining the room is handed.** The room's
+  instructions, and its documents, references, packages and linked rooms
+  with their own instructions, read from what `connect_to_room` returns, so
+  a room's briefing can be checked without spending an agent on it. What a
+  reference points at is shown only to whoever manages the room.
 - **A reconnect storm is paced instead of taking the pool.** When a pod goes
   away, every agent and controller it held opens a connection on the pods
   left within seconds. On staging (two pods, 1,000 agents, one pod deleted)
